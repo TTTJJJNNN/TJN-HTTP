@@ -1,0 +1,36 @@
+# 构建目录
+build/
+cmake-build-*/
+
+# 编译生成文件
+*.o
+*.so
+*.a
+*.exe
+*.out
+*.dll
+
+# CMake生成文件
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+
+# 可执行文件
+tjn_http_server
+
+# IDE文件
+.vscode/
+.idea/
+*.user
+*.suo
+*.sln
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 临时文件
+*.tmp
+*.log

@@ -1,20 +1,29 @@
 #include <iostream>
+
 #include <string>
 #include <cstring>
 #include <vector>
 #include <map>
 #include <memory>
 #include <functional>
+
 #include <thread>
 #include <atomic>
 #include <mutex>
+
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
 #include <netinet/in.h>
 #include <fcntl.h>
+
 #include <errno.h>
+#include <csignal>
+
+#include "http_server/http_request.h"
+#include "http_server/http_response.h"
+#include "http_server/router.h"
 
 const int PORT = 8888;
 const int MAX_EVENTS = 10000;      // epoll最大事件数
@@ -81,6 +90,7 @@ struct ClientConnection {
     // 添加发送数据
     void queue_send(const std::string& data) {
         send_buffer += data;
+        std::cout << "Queued " << data.length() << " bytes for sending to client [" << id << "]" << std::endl;
     }
     
     // 尝试发送数据
@@ -89,9 +99,7 @@ struct ClientConnection {
             return 0;
         }
         
-        ssize_t sent = send(fd, send_buffer.c_str() + send_offset, 
-                           send_buffer.length() - send_offset, 
-                           MSG_NOSIGNAL);
+        ssize_t sent = send(fd, send_buffer.c_str() + send_offset, send_buffer.length() - send_offset, MSG_NOSIGNAL);
         
         if (sent > 0) {
             send_offset += sent;
@@ -143,8 +151,9 @@ public:
     
     // 初始化服务器
     bool init() {
-        // 创建socket
-        server_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        // 创建socket，设置为IPv4 TCP 非阻塞
+        server_fd = socket(AF_INET, SOCK_STREAM, 0);
+        fcntl(server_fd, F_SETFL, O_NONBLOCK);
         if (server_fd == -1) {
             std::cerr << "创建socket失败: " << strerror(errno) << std::endl;
             return false;
@@ -206,8 +215,7 @@ public:
             sockaddr_in client_addr;
             socklen_t client_len = sizeof(client_addr);
             
-            int client_fd = accept4(server_fd, (sockaddr*)&client_addr, 
-                                   &client_len, SOCK_NONBLOCK);
+            int client_fd = accept4(server_fd, (sockaddr*)&client_addr, &client_len, SOCK_NONBLOCK);
             
             if (client_fd == -1) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -227,8 +235,7 @@ public:
             
             // 创建客户端连接
             int client_id = next_client_id++;
-            auto client = std::make_shared<ClientConnection>(
-                client_fd, client_addr, client_id);
+            auto client = std::make_shared<ClientConnection>(client_fd, client_addr, client_id);
             
             {
                 std::lock_guard<std::mutex> lock(clients_mutex);
@@ -240,7 +247,8 @@ public:
             
             // 添加到epoll监控
             epoll_event ev;
-            ev.events = EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP;
+            // 不默认监听 EPOLLOUT，只有在有数据时开启
+            ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
             ev.data.ptr = client.get();
             
             if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev) == -1) {
@@ -255,17 +263,23 @@ public:
                       << ", 总连接: " << total_connections << ")" << std::endl;
             
             // 发送欢迎消息
-            std::string welcome = "Welcome! Your ID: " + std::to_string(client_id) + "\n";
-            client->queue_send(welcome);
+            // std::string welcome = "Welcome! Your ID: " + std::to_string(client_id) + "\n";
+            // client->queue_send(welcome);
+
+            // 有数据要发，启用写事件
+            enable_write_event(client.get());
         }
     }
     
+
     // 处理客户端数据
     void handle_client_data(ClientConnection* client) {
-        while (true) {  // 边缘触发需要循环读取
+        bool peer_closed = false;
+
+        // 边缘触发需要循环读取
+        while (true) {  
             char temp_buffer[BUFFER_SIZE];
             ssize_t count = recv(client->fd, temp_buffer, sizeof(temp_buffer), 0);
-            
             if (count == -1) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     break;  // 没有更多数据了
@@ -274,8 +288,8 @@ public:
                 remove_client(client->fd);
                 break;
             } else if (count == 0) {
-                // 客户端关闭连接
-                remove_client(client->fd);
+                // 对端已关闭写端（EOF），不要立刻移除，先处理已接收的数据
+                peer_closed = true;
                 break;
             }
             
@@ -285,16 +299,39 @@ public:
             // 添加到缓冲区
             client->append_data(temp_buffer, count);
             total_messages++;
-            
-            // 处理接收到的数据
-            std::string line;
-            while (client->get_line(line)) {
-                process_message(client, line);
+        }
+        
+        // 处理缓冲区中的数据
+        if (client->buffer_len > 0) {
+            // 检查是否是HTTP请求
+            if (is_http_request(std::string(client->buffer, client->buffer_len))) {
+                // 检查HTTP请求是否完整
+                if (is_http_request_complete(client->buffer, client->buffer_len)) {
+                    std::string request(client->buffer, client->buffer_len);
+                    handle_http_request(client, request);
+                    
+                    // 清空已处理的数据
+                    client->buffer_len = 0;
+                } else {
+                    std::cout << "HTTP请求不完整，等待更多数据..." << std::endl;
+                    std::cout << "当前缓冲区大小: " << client->buffer_len << " 字节" << std::endl;
+                }
+            } else {
+                // 处理普通消息（非HTTP）
+                std::string line;
+                while (client->get_line(line)) {
+                    process_message(client, line);
+                }
             }
+        }
+
+        // 如果对端已关闭且缓冲已处理完，则关闭连接
+        if (peer_closed && client->buffer_len == 0) {
+            remove_client(client->fd);
         }
     }
     
-    // 处理客户端消息
+    // 处理非http请求
     void process_message(ClientConnection* client, const std::string& message) {
         std::string trimmed_msg = message;
         if (!trimmed_msg.empty() && trimmed_msg.back() == '\n') {
@@ -313,7 +350,7 @@ public:
             remove_client(client->fd);
         } else if (trimmed_msg == "count") {
             std::string response = "当前在线: " + std::to_string(active_clients) 
-                                 + ", 总连接: " + std::to_string(total_connections) + "\n";
+                                + ", 总连接: " + std::to_string(total_connections) + "\n";
             client->queue_send(response);
         } else if (trimmed_msg == "time") {
             time_t now = time(nullptr);
@@ -321,18 +358,75 @@ public:
             client->queue_send(response);
         } else if (trimmed_msg == "stats") {
             std::string response = "统计信息:\n"
-                                 "  在线客户端: " + std::to_string(active_clients) + "\n"
-                                 "  总连接数: " + std::to_string(total_connections) + "\n"
-                                 "  总消息数: " + std::to_string(total_messages) + "\n";
+                                "  在线客户端: " + std::to_string(active_clients) + "\n"
+                                "  总连接数: " + std::to_string(total_connections) + "\n"
+                                "  总消息数: " + std::to_string(total_messages) + "\n";
             client->queue_send(response);
         } else {
             // 默认回声
             std::string response = "回声: " + trimmed_msg + "\n";
             client->queue_send(response);
+            enable_write_event(client);
         }
+    }    
+
+    // 处理http请求
+    void handle_http_request(ClientConnection* client, const std::string& request_data) {
+        // 解析HTTP请求
+        http_request_t* req = parse_http_request(request_data.c_str(), (int)request_data.length());
+        // 路由处理
+        http_response_t* resp = route_request(req);
+        // 转换为字符串并存入发送缓冲区
+        int resp_len;
+        char* resp_str = http_response_to_string(resp, &resp_len);
+        client->queue_send(std::string(resp_str, resp_len));
+        // 有数据待发，启用写事件
+        enable_write_event(client);
+        // 释放资源
+        free_http_response(resp);
+        free_http_request(req);
+        delete[] resp_str;
     }
-    
-    // 处理客户端发送
+
+    // 是否是HTTP请求
+    bool is_http_request(const std::string& data) {
+        // 检查是否是HTTP请求（检查请求方法）
+        if (data.length() < 4) return false;
+        return (data.substr(0, 3) == "GET" || 
+                data.substr(0, 4) == "POST" ||
+                data.substr(0, 3) == "PUT" ||
+                data.substr(0, 6) == "DELETE" ||
+                data.substr(0, 4) == "HEAD" ||
+                data.substr(0, 7) == "OPTIONS" ||
+                data.substr(0, 5) == "PATCH");
+    }
+
+    // 是否是完整的HTTP请求
+    bool is_http_request_complete(const char* buffer, size_t len) {
+        if (len < 4) return false;
+        
+        // 查找头部结束标记 \r\n\r\n
+        const char* end_of_headers = strstr(buffer, "\r\n\r\n");
+        if (!end_of_headers) return false;
+        
+        // 检查是否有Content-Length
+        const char* cl_header = strstr(buffer, "Content-Length:");
+        if (cl_header) {
+            int content_length = 0;
+            sscanf(cl_header + 15, "%d", &content_length);
+            
+            // 计算头部长度
+            size_t headers_len = end_of_headers - buffer + 4;  // +4 for \r\n\r\n
+            size_t total_needed = headers_len + content_length;
+            
+            return len >= total_needed;
+        }
+        
+        // 没有body的请求，头部结束就是完整请求
+        return true;
+    }
+
+    // 处理发送
     void handle_client_send(ClientConnection* client) {
         ssize_t sent = client->try_send();
         if (sent == -1) {
@@ -340,24 +434,60 @@ public:
                 remove_client(client->fd);
             }
         }
+
+        // 边缘触发下需要循环发送直到出错或返回 EAGAIN
+        while (true) {
+            ssize_t sent = client->try_send();
+            if (sent > 0) {
+                continue; // 继续发送直到 EAGAIN
+            }
+            if (sent == 0) {
+                // 没有更多数据需要立即发送
+                break;
+            }
+            // sent == -1: 出错或 EAGAIN
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            } else {
+                remove_client(client->fd);
+                return;
+            }
+        }
+
+        // 发送完了就关闭写事件以避免无谓触发
+        if (client->send_buffer.empty()) {
+            disable_write_event(client);
+        }
     }
     
+
     // 移除客户端
     void remove_client(int fd) {
         std::lock_guard<std::mutex> lock(clients_mutex);
         auto it = clients.find(fd);
         if (it != clients.end()) {
-            std::cout << "客户端 [" << it->second->id << "] 断开连接" 
-                      << " (剩余: " << active_clients - 1 << ")" << std::endl;
-            
-            // 从epoll移除
             epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
-            
             clients.erase(it);
             active_clients--;
         }
     }
     
+    // 启用写事件
+    void enable_write_event(ClientConnection* client) {
+        epoll_event ev;
+        ev.events = EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP;
+        ev.data.ptr = client;
+        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd, &ev);
+    }
+
+    // 禁用写事件
+    void disable_write_event(ClientConnection* client) {
+        epoll_event ev;
+        ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
+        ev.data.ptr = client;
+        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd, &ev);
+    }
+
     // 清理空闲连接（心跳检测）
     void cleanup_idle_connections(int idle_timeout = 300) {  // 5分钟
         time_t now = time(nullptr);
@@ -378,27 +508,27 @@ public:
         }
     }
     
-    // 主循环
-    void run() {
-        running = true;
-        
-        // 启动工作线程（可选）
+    // 构建工作线程池
+    void start_worker_threads() {
         int num_workers = std::thread::hardware_concurrency();
         if (num_workers == 0) num_workers = 4;
         
         std::cout << "启动 " << num_workers << " 个工作线程" << std::endl;
         
         for (int i = 0; i < num_workers; ++i) {
-            worker_threads.emplace_back([this, i]() {
-                worker_thread_function(i);
-            });
+            worker_threads.emplace_back([this, i]() {worker_thread_function(i);});
         }
+    }
+
+    // 主循环
+    void run() {
+        running = true;
+        start_worker_threads();  // 在主循环开始前启动工作线程
         
-        // 主线程处理epoll事件
-        epoll_event events[MAX_EVENTS];
+        epoll_event events[MAX_EVENTS]; // 主线程处理epoll事件
         
         while (running) {
-            // 等待事件
+            // 等待事件，并返回就绪事件个数nfds
             int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, EPOLL_TIMEOUT);
             
             if (nfds == -1) {
@@ -412,22 +542,18 @@ public:
             // 处理事件
             for (int i = 0; i < nfds; ++i) {
                 if (events[i].data.fd == server_fd) {
-                    // 新连接
+                    // 新连接到来
                     handle_new_connection();
                 } else {
-                    // 客户端事件
                     ClientConnection* client = static_cast<ClientConnection*>(events[i].data.ptr);
-                    
                     if (events[i].events & EPOLLIN) {
                         // 可读事件
                         handle_client_data(client);
                     }
-                    
                     if (events[i].events & EPOLLOUT) {
                         // 可写事件
                         handle_client_send(client);
                     }
-                    
                     if (events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
                         // 连接关闭或错误
                         remove_client(client->fd);
